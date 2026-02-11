@@ -1,0 +1,42 @@
+# .github/workflows/sync-upstream.yml
+# Automatically syncs fork with upstream repository
+# Triggers: daily schedule, manual dispatch
+
+name: Sync with Upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required for pushing changes
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for all branches
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/jo-inc/camofox-browser.git || true
+          git fetch upstream
+
+      - name: Sync master branch
+        run: |
+          git checkout master
+          git merge upstream/master --ff-only || git merge upstream/master -m "chore: sync with upstream"
+          git push origin master
+
+      - name: Clean up
+        if: always()
+        run: git remote remove upstream || true
