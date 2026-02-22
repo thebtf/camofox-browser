@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const os = require('os');
 const { expandMacro } = require('./lib/macros');
 const { loadConfig } = require('./lib/config');
+const { windowSnapshot } = require('./lib/snapshot');
 
 const CONFIG = loadConfig();
 
@@ -175,9 +176,14 @@ const SESSION_TIMEOUT_MS = parseInt(process.env.SESSION_TIMEOUT_MS) || 1800000; 
 const MAX_SNAPSHOT_NODES = 500;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS) || 50;
 const MAX_TABS_PER_SESSION = parseInt(process.env.MAX_TABS_PER_SESSION) || 10;
+const MAX_TABS_GLOBAL = parseInt(process.env.MAX_TABS_GLOBAL) || 10;
 const HANDLER_TIMEOUT_MS = parseInt(process.env.HANDLER_TIMEOUT_MS) || 30000;
 const MAX_CONCURRENT_PER_USER = parseInt(process.env.MAX_CONCURRENT_PER_USER) || 3;
 const PAGE_CLOSE_TIMEOUT_MS = 5000;
+const NAVIGATE_TIMEOUT_MS = parseInt(process.env.NAVIGATE_TIMEOUT_MS) || 25000;
+const BUILDREFS_TIMEOUT_MS = parseInt(process.env.BUILDREFS_TIMEOUT_MS) || 12000;
+const FAILURE_THRESHOLD = 3;
+const TAB_LOCK_TIMEOUT_MS = 30000;
 
 // Per-tab locks to serialize operations on the same tab
 // tabId -> Promise (the currently executing operation)
@@ -188,9 +194,14 @@ async function withTabLock(tabId, operation) {
   const pending = tabLocks.get(tabId);
   if (pending) {
     try {
-      await pending;
+      await Promise.race([
+        pending,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Tab lock timeout')), TAB_LOCK_TIMEOUT_MS))
+      ]);
     } catch (e) {
-      // Previous operation failed, continue anyway
+      if (e.message === 'Tab lock timeout') {
+        log('warn', 'tab lock timeout, proceeding', { tabId });
+      }
     }
   }
   
@@ -233,9 +244,13 @@ async function withUserLimit(userId, operation) {
     });
   }
   state.active++;
+  healthState.activeOps++;
   try {
-    return await operation();
+    const result = await operation();
+    healthState.lastSuccessfulNav = Date.now();
+    return result;
   } finally {
+    healthState.activeOps--;
     state.active--;
     if (state.queue.length > 0) {
       const next = state.queue.shift();
@@ -305,6 +320,59 @@ function clearBrowserIdleTimer() {
     clearTimeout(browserIdleTimer);
     browserIdleTimer = null;
   }
+}
+
+// --- Browser health tracking ---
+const healthState = {
+  consecutiveNavFailures: 0,
+  lastSuccessfulNav: Date.now(),
+  isRecovering: false,
+  activeOps: 0,
+};
+
+function recordNavSuccess() {
+  healthState.consecutiveNavFailures = 0;
+  healthState.lastSuccessfulNav = Date.now();
+}
+
+function recordNavFailure() {
+  healthState.consecutiveNavFailures++;
+  return healthState.consecutiveNavFailures >= FAILURE_THRESHOLD;
+}
+
+async function restartBrowser(reason) {
+  if (healthState.isRecovering) return;
+  healthState.isRecovering = true;
+  log('error', 'restarting browser', { reason, failures: healthState.consecutiveNavFailures });
+  try {
+    for (const [, session] of sessions) {
+      await session.context.close().catch(() => {});
+    }
+    sessions.clear();
+    if (browser) {
+      await browser.close().catch(() => {});
+      browser = null;
+    }
+    browserLaunchPromise = null;
+    await ensureBrowser();
+    healthState.consecutiveNavFailures = 0;
+    healthState.lastSuccessfulNav = Date.now();
+    log('info', 'browser restarted successfully');
+  } catch (err) {
+    log('error', 'browser restart failed', { error: err.message });
+  } finally {
+    healthState.isRecovering = false;
+  }
+}
+
+function getTotalTabCount() {
+  let total = 0;
+  for (const session of sessions.values()) {
+    for (const group of session.tabGroups.values()) {
+      total += group.size;
+    }
+  }
+  return total;
 }
 
 async function launchBrowserInstance() {
@@ -406,7 +474,8 @@ function createTabState(page) {
     page,
     refs: new Map(),
     visitedUrls: new Set(),
-    toolCalls: 0
+    toolCalls: 0,
+    lastSnapshot: null,
   };
 }
 
@@ -507,19 +576,47 @@ async function buildRefs(page) {
     return refs;
   }
   
+  const start = Date.now();
+  
+  // Hard total timeout on the entire buildRefs operation
+  const timeoutPromise = new Promise((_, reject) => 
+    setTimeout(() => reject(new Error('buildRefs_timeout')), BUILDREFS_TIMEOUT_MS)
+  );
+  
+  try {
+    return await Promise.race([
+      _buildRefsInner(page, refs, start),
+      timeoutPromise
+    ]);
+  } catch (err) {
+    if (err.message === 'buildRefs_timeout') {
+      log('warn', 'buildRefs: total timeout exceeded', { elapsed: Date.now() - start });
+      return refs;
+    }
+    throw err;
+  }
+}
+
+async function _buildRefsInner(page, refs, start) {
   await waitForPageReady(page, { waitForNetwork: false });
   
-  // Get ARIA snapshot including shadow DOM content
-  // Playwright's ariaSnapshot already traverses shadow roots, but we also
-  // inject a script to collect shadow DOM elements for additional coverage
+  // Budget remaining time for ariaSnapshot
+  const elapsed = Date.now() - start;
+  const remaining = BUILDREFS_TIMEOUT_MS - elapsed;
+  if (remaining < 2000) {
+    log('warn', 'buildRefs: insufficient time for ariaSnapshot', { elapsed });
+    return refs;
+  }
+  
   let ariaYaml;
   try {
-    ariaYaml = await page.locator('body').ariaSnapshot({ timeout: 5000 });
+    ariaYaml = await page.locator('body').ariaSnapshot({ timeout: Math.min(remaining - 1000, 5000) });
   } catch (err) {
     log('warn', 'ariaSnapshot failed, retrying');
+    const retryBudget = BUILDREFS_TIMEOUT_MS - (Date.now() - start);
+    if (retryBudget < 2000) return refs;
     try {
-      await page.waitForLoadState('load', { timeout: 3000 }).catch(() => {});
-      ariaYaml = await page.locator('body').ariaSnapshot({ timeout: 5000 });
+      ariaYaml = await page.locator('body').ariaSnapshot({ timeout: Math.min(retryBudget - 500, 5000) });
     } catch (retryErr) {
       log('warn', 'ariaSnapshot retry failed, returning empty refs', { error: retryErr.message });
       return refs;
@@ -593,14 +690,314 @@ function refToLocator(page, ref, refs) {
   return locator;
 }
 
-// Health check (passive — does not launch browser)
+// --- YouTube transcript extraction via yt-dlp ---
+// POST /youtube/transcript { url, languages? }
+// Uses yt-dlp to extract subtitles — no browser needed, no ads, no playback.
+// yt-dlp handles YouTube's signed caption URLs correctly.
+// Falls back to Camoufox page intercept if yt-dlp is not installed.
+
+const { execFile } = require('child_process');
+const { mkdtemp, readFile, readdir, rm } = require('fs/promises');
+const { tmpdir } = require('os');
+const { join } = require('path');
+
+// Detect yt-dlp binary at startup
+let ytDlpPath = null;
+(async () => {
+  for (const candidate of ['yt-dlp', '/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp']) {
+    try {
+      await new Promise((resolve, reject) => {
+        execFile(candidate, ['--version'], { timeout: 5000 }, (err, stdout) => {
+          if (err) return reject(err);
+          resolve(stdout.trim());
+        });
+      });
+      ytDlpPath = candidate;
+      log('info', 'yt-dlp found', { path: candidate });
+      break;
+    } catch {}
+  }
+  if (!ytDlpPath) log('warn', 'yt-dlp not found — YouTube transcript endpoint will use browser fallback');
+})();
+
+app.post('/youtube/transcript', async (req, res) => {
+  const reqId = req.reqId;
+  try {
+    const { url, languages = ['en'] } = req.body;
+    if (!url) return res.status(400).json({ error: 'url is required' });
+
+    const urlErr = validateUrl(url);
+    if (urlErr) return res.status(400).json({ error: urlErr });
+
+    const videoIdMatch = url.match(
+      /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/
+    );
+    if (!videoIdMatch) {
+      return res.status(400).json({ error: 'Could not extract YouTube video ID from URL' });
+    }
+    const videoId = videoIdMatch[1];
+    const lang = languages[0] || 'en';
+
+    log('info', 'youtube transcript: starting', { reqId, videoId, lang, method: ytDlpPath ? 'yt-dlp' : 'browser' });
+
+    let result;
+    if (ytDlpPath) {
+      result = await ytDlpTranscript(reqId, url, videoId, lang);
+    } else {
+      result = await browserTranscript(reqId, url, videoId, lang);
+    }
+
+    log('info', 'youtube transcript: done', { reqId, videoId, status: result.status, words: result.total_words });
+    res.json(result);
+  } catch (err) {
+    log('error', 'youtube transcript failed', { reqId, error: err.message, stack: err.stack });
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// Strategy 1: yt-dlp (preferred — fast, no browser, no ads)
+async function ytDlpTranscript(reqId, url, videoId, lang) {
+  const tmpDir = await mkdtemp(join(tmpdir(), 'yt-'));
+  try {
+    // Step 1: Get title via --print (fast, no download)
+    const title = await new Promise((resolve, reject) => {
+      execFile(ytDlpPath, [
+        '--skip-download', '--no-warnings', '--print', '%(title)s', url,
+      ], { timeout: 15000 }, (err, stdout) => {
+        if (err) return reject(new Error(`yt-dlp metadata failed: ${err.message}`));
+        resolve(stdout.trim().split('\n')[0] || '');
+      });
+    });
+
+    // Step 2: Download subtitles to temp dir
+    await new Promise((resolve, reject) => {
+      execFile(ytDlpPath, [
+        '--skip-download',
+        '--write-sub', '--write-auto-sub',
+        '--sub-lang', lang,
+        '--sub-format', 'json3',
+        '-o', join(tmpDir, '%(id)s'),
+        url,
+      ], { timeout: 30000 }, (err, stdout, stderr) => {
+        if (err) return reject(new Error(`yt-dlp subtitle download failed: ${err.message}\n${stderr}`));
+        resolve();
+      });
+    });
+
+    // Find the subtitle file
+    const files = await readdir(tmpDir);
+    const subFile = files.find(f => f.endsWith('.json3') || f.endsWith('.vtt') || f.endsWith('.srv3'));
+    if (!subFile) {
+      return {
+        status: 'error', code: 404,
+        message: 'No captions available for this video',
+        video_url: url, video_id: videoId, title,
+      };
+    }
+
+    const content = await readFile(join(tmpDir, subFile), 'utf8');
+    let transcriptText = null;
+
+    if (subFile.endsWith('.json3')) {
+      transcriptText = parseJson3(content);
+    } else if (subFile.endsWith('.vtt')) {
+      transcriptText = parseVtt(content);
+    } else {
+      transcriptText = parseXml(content);
+    }
+
+    if (!transcriptText || !transcriptText.trim()) {
+      return {
+        status: 'error', code: 404,
+        message: 'Subtitle file found but content was empty',
+        video_url: url, video_id: videoId, title,
+      };
+    }
+
+    // Detect language from filename (e.g., dQw4w9WgXcQ.en.json3)
+    const langMatch = subFile.match(/\.([a-z]{2}(?:-[a-zA-Z]+)?)\.(?:json3|vtt|srv3)$/);
+
+    return {
+      status: 'ok', transcript: transcriptText,
+      video_url: url, video_id: videoId, video_title: title,
+      language: langMatch?.[1] || lang,
+      total_words: transcriptText.split(/\s+/).length,
+    };
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// Strategy 2: Browser fallback — play video, intercept timedtext network response
+async function browserTranscript(reqId, url, videoId, lang) {
+  return await withUserLimit('__yt_transcript__', async () => {
+    await ensureBrowser();
+    const session = await getSession('__yt_transcript__');
+    const page = await session.context.newPage();
+
+    try {
+      // Mute audio
+      await page.addInitScript(() => {
+        const origPlay = HTMLMediaElement.prototype.play;
+        HTMLMediaElement.prototype.play = function() { this.volume = 0; this.muted = true; return origPlay.call(this); };
+      });
+
+      // Intercept timedtext responses — filter by video ID to skip ad captions
+      let interceptedCaptions = null;
+      page.on('response', async (response) => {
+        const respUrl = response.url();
+        if (respUrl.includes('/api/timedtext') && respUrl.includes(`v=${videoId}`) && !interceptedCaptions) {
+          try {
+            const body = await response.text();
+            if (body && body.length > 0) interceptedCaptions = body;
+          } catch {}
+        }
+      });
+
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS });
+      await page.waitForTimeout(2000);
+
+      // Extract metadata from ytInitialPlayerResponse
+      const meta = await page.evaluate(() => {
+        const r = window.ytInitialPlayerResponse || (typeof ytInitialPlayerResponse !== 'undefined' ? ytInitialPlayerResponse : null);
+        if (!r) return { title: '' };
+        const tracks = r?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+        return {
+          title: r?.videoDetails?.title || '',
+          languages: tracks.map(t => ({ code: t.languageCode, name: t.name?.simpleText || t.languageCode, kind: t.kind || 'manual' })),
+        };
+      });
+
+      // Start playback to trigger caption loading
+      await page.evaluate(() => {
+        const v = document.querySelector('video');
+        if (v) { v.muted = true; v.play().catch(() => {}); }
+      }).catch(() => {});
+
+      // Wait up to 20s for the target video's captions (may need to sit through an ad)
+      for (let i = 0; i < 40 && !interceptedCaptions; i++) {
+        await page.waitForTimeout(500);
+      }
+
+      if (!interceptedCaptions) {
+        return {
+          status: 'error', code: 404,
+          message: 'No captions loaded during playback (video may have no captions, or ad blocked it)',
+          video_url: url, video_id: videoId, title: meta.title,
+        };
+      }
+
+      log('info', 'youtube transcript: intercepted captions', { reqId, len: interceptedCaptions.length });
+
+      let transcriptText = null;
+      if (interceptedCaptions.trimStart().startsWith('{')) transcriptText = parseJson3(interceptedCaptions);
+      else if (interceptedCaptions.includes('WEBVTT')) transcriptText = parseVtt(interceptedCaptions);
+      else if (interceptedCaptions.includes('<text')) transcriptText = parseXml(interceptedCaptions);
+
+      if (!transcriptText || !transcriptText.trim()) {
+        return {
+          status: 'error', code: 404,
+          message: 'Caption data intercepted but could not be parsed',
+          video_url: url, video_id: videoId, title: meta.title,
+        };
+      }
+
+      return {
+        status: 'ok', transcript: transcriptText,
+        video_url: url, video_id: videoId, video_title: meta.title,
+        language: lang, total_words: transcriptText.split(/\s+/).length,
+        available_languages: meta.languages,
+      };
+    } finally {
+      await safePageClose(page);
+    }
+  });
+}
+
+// --- YouTube transcript parsers ---
+
+function parseJson3(content) {
+  try {
+    const data = JSON.parse(content);
+    const events = data.events || [];
+    const lines = [];
+    for (const event of events) {
+      const segs = event.segs || [];
+      if (!segs.length) continue;
+      const text = segs.map(s => s.utf8 || '').join('').trim();
+      if (!text) continue;
+      const tsMs = event.tStartMs || 0;
+      const tsSec = Math.floor(tsMs / 1000);
+      const mm = Math.floor(tsSec / 60);
+      const ss = tsSec % 60;
+      lines.push(`[${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}] ${text}`);
+    }
+    return lines.join('\n');
+  } catch (e) {
+    return null;
+  }
+}
+
+function parseVtt(content) {
+  const lines = content.split('\n');
+  const result = [];
+  let currentTimestamp = '';
+  for (const line of lines) {
+    const stripped = line.trim();
+    if (!stripped || stripped === 'WEBVTT' || stripped.startsWith('Kind:') || stripped.startsWith('Language:') || stripped.startsWith('NOTE')) continue;
+    if (stripped.includes(' --> ')) {
+      const parts = stripped.split(' --> ');
+      if (parts[0]) currentTimestamp = formatVttTs(parts[0].trim());
+      continue;
+    }
+    const text = stripped.replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
+    if (text && currentTimestamp) { result.push(`[${currentTimestamp}] ${text}`); currentTimestamp = ''; }
+    else if (text) result.push(text);
+  }
+  return result.join('\n');
+}
+
+function parseXml(content) {
+  const lines = [];
+  const regex = /<text\s+start="([^"]*)"[^>]*>([\s\S]*?)<\/text>/g;
+  let match;
+  while ((match = regex.exec(content)) !== null) {
+    const startSec = parseFloat(match[1]) || 0;
+    const text = match[2].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
+    if (!text) continue;
+    const mm = Math.floor(startSec / 60);
+    const ss = Math.floor(startSec % 60);
+    lines.push(`[${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}] ${text}`);
+  }
+  return lines.join('\n');
+}
+
+function formatVttTs(ts) {
+  const parts = ts.split(':');
+  if (parts.length >= 3) {
+    const hours = parseInt(parts[0]) || 0;
+    const minutes = parseInt(parts[1]) || 0;
+    const totalMin = hours * 60 + minutes;
+    const seconds = (parts[2] || '00').split('.')[0];
+    return `${String(totalMin).padStart(2, '0')}:${seconds}`;
+  } else if (parts.length === 2) {
+    return `${String(parseInt(parts[0])).padStart(2, '0')}:${(parts[1] || '00').split('.')[0]}`;
+  }
+  return ts;
+}
+
 app.get('/health', (req, res) => {
+  if (healthState.isRecovering) {
+    return res.status(503).json({ ok: false, engine: 'camoufox', recovering: true });
+  }
   const running = browser !== null && (browser.isConnected?.() ?? false);
   res.json({ 
     ok: true, 
     engine: 'camoufox',
     browserConnected: running,
     browserRunning: running,
+    activeTabs: getTotalTabCount(),
+    consecutiveFailures: healthState.consecutiveNavFailures,
   });
 });
 
@@ -657,23 +1054,46 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       let session = sessions.get(normalizeUserId(userId));
       let found = session && findTab(session, tabId);
       
+      let tabState;
       if (!found) {
         const resolvedSessionKey = sessionKey || listItemId || 'default';
         session = await getSession(userId);
-        let totalTabs = 0;
-        for (const g of session.tabGroups.values()) totalTabs += g.size;
-        if (totalTabs >= MAX_TABS_PER_SESSION) {
-          throw new Error('Maximum tabs per session reached');
+        let sessionTabs = 0;
+        for (const g of session.tabGroups.values()) sessionTabs += g.size;
+        if (getTotalTabCount() >= MAX_TABS_GLOBAL || sessionTabs >= MAX_TABS_PER_SESSION) {
+          // Reuse oldest tab in session instead of rejecting
+          let oldestTab = null;
+          let oldestGroup = null;
+          let oldestTabId = null;
+          for (const [gKey, group] of session.tabGroups) {
+            for (const [tid, ts] of group) {
+              if (!oldestTab || ts.toolCalls < oldestTab.toolCalls) {
+                oldestTab = ts;
+                oldestGroup = group;
+                oldestTabId = tid;
+              }
+            }
+          }
+          if (oldestTab) {
+            tabState = oldestTab;
+            const group = getTabGroup(session, resolvedSessionKey);
+            if (oldestGroup) oldestGroup.delete(oldestTabId);
+            group.set(tabId, tabState);
+            tabLocks.delete(oldestTabId);
+            log('info', 'tab recycled (limit reached)', { reqId: req.reqId, tabId, recycledFrom: oldestTabId, userId });
+          } else {
+            throw new Error('Maximum tabs per session reached');
+          }
+        } else {
+          const page = await session.context.newPage();
+          tabState = createTabState(page);
+          const group = getTabGroup(session, resolvedSessionKey);
+          group.set(tabId, tabState);
+          log('info', 'tab auto-created on navigate', { reqId: req.reqId, tabId, userId });
         }
-        const page = await session.context.newPage();
-        const newTabState = createTabState(page);
-        const group = getTabGroup(session, resolvedSessionKey);
-        group.set(tabId, newTabState);
-        found = { tabState: newTabState, listItemId: resolvedSessionKey, group };
-        log('info', 'tab auto-created on navigate', { reqId: req.reqId, tabId, userId });
+      } else {
+        tabState = found.tabState;
       }
-      
-      const { tabState } = found;
       tabState.toolCalls++;
       
       let targetUrl = url;
@@ -689,8 +1109,9 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       return await withTabLock(tabId, async () => {
         await tabState.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
         tabState.visitedUrls.add(targetUrl);
+        tabState.lastSnapshot = null;
         tabState.refs = await buildRefs(tabState.page);
-        return { ok: true, tabId, url: tabState.page.url() };
+        return { ok: true, tabId, url: tabState.page.url(), refsAvailable: tabState.refs.size > 0 };
       });
     })(), HANDLER_TIMEOUT_MS, 'navigate'));
     
@@ -709,12 +1130,25 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
     const userId = req.query.userId;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const format = req.query.format || 'text';
+    const offset = parseInt(req.query.offset) || 0;
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, req.params.tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     
     const { tabState } = found;
     tabState.toolCalls++;
+
+    // Cached chunk retrieval for offset>0 requests
+    if (offset > 0 && tabState.lastSnapshot) {
+      const win = windowSnapshot(tabState.lastSnapshot, offset);
+      const response = { url: tabState.page.url(), snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
+      if (req.query.includeScreenshot === 'true') {
+        const pngBuffer = await tabState.page.screenshot({ type: 'png' });
+        response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
+      }
+      log('info', 'snapshot (cached offset)', { reqId: req.reqId, tabId: req.params.tabId, offset, totalChars: win.totalChars });
+      return res.json(response);
+    }
 
     const result = await withUserLimit(userId, () => withTimeout((async () => {
       tabState.refs = await buildRefs(tabState.page);
@@ -754,14 +1188,28 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
         }).join('\n');
       }
       
-      return {
+      tabState.lastSnapshot = annotatedYaml;
+      const win = windowSnapshot(annotatedYaml, 0);
+
+      const response = {
         url: tabState.page.url(),
-        snapshot: annotatedYaml,
-        refsCount: tabState.refs.size
+        snapshot: win.text,
+        refsCount: tabState.refs.size,
+        truncated: win.truncated,
+        totalChars: win.totalChars,
+        hasMore: win.hasMore,
+        nextOffset: win.nextOffset,
       };
+
+      if (req.query.includeScreenshot === 'true') {
+        const pngBuffer = await tabState.page.screenshot({ type: 'png' });
+        response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
+      }
+
+      return response;
     })(), HANDLER_TIMEOUT_MS, 'snapshot'));
 
-    log('info', 'snapshot', { reqId: req.reqId, tabId: req.params.tabId, url: result.url, snapshotLen: result.snapshot?.length, refsCount: result.refsCount });
+    log('info', 'snapshot', { reqId: req.reqId, tabId: req.params.tabId, url: result.url, snapshotLen: result.snapshot?.length, refsCount: result.refsCount, hasScreenshot: !!result.screenshot, truncated: result.truncated });
     res.json(result);
   } catch (err) {
     log('error', 'snapshot failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
@@ -844,7 +1292,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
               log('warn', 'force click failed, trying mouse sequence');
               await dispatchMouseSequence(locator);
             }
-          } else if (err.message.includes('not visible') || err.message.includes('timeout')) {
+          } else if (err.message.includes('not visible') || err.message.toLowerCase().includes('timeout')) {
             // Fallback 2: Element not responding to click, try mouse sequence
             log('warn', 'click timeout, trying mouse sequence');
             await dispatchMouseSequence(locator);
@@ -855,7 +1303,13 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       };
       
       if (ref) {
-        const locator = refToLocator(tabState.page, ref, tabState.refs);
+        let locator = refToLocator(tabState.page, ref, tabState.refs);
+        if (!locator && tabState.refs.size === 0) {
+          // Auto-refresh refs on stale state before failing
+          log('info', 'auto-refreshing stale refs before click', { ref });
+          tabState.refs = await buildRefs(tabState.page);
+          locator = refToLocator(tabState.page, ref, tabState.refs);
+        }
         if (!locator) {
           const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
           throw new Error(`Unknown ref: ${ref} (valid refs: e1-${maxRef}, ${tabState.refs.size} total). Refs reset after navigation - call snapshot first.`);
@@ -866,11 +1320,12 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       }
       
       await tabState.page.waitForTimeout(500);
+      tabState.lastSnapshot = null;
       tabState.refs = await buildRefs(tabState.page);
       
       const newUrl = tabState.page.url();
       tabState.visitedUrls.add(newUrl);
-      return { ok: true, url: newUrl };
+      return { ok: true, url: newUrl, refsAvailable: tabState.refs.size > 0 };
     }), HANDLER_TIMEOUT_MS, 'click'));
     
     log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url });
@@ -1363,6 +1818,7 @@ app.post('/navigate', async (req, res) => {
 app.get('/snapshot', async (req, res) => {
   try {
     const { targetId, userId, format = 'text' } = req.query;
+    const offset = parseInt(req.query.offset) || 0;
     if (!userId) {
       return res.status(400).json({ error: 'userId is required' });
     }
@@ -1375,6 +1831,18 @@ app.get('/snapshot', async (req, res) => {
     
     const { tabState } = found;
     tabState.toolCalls++;
+
+    // Cached chunk retrieval
+    if (offset > 0 && tabState.lastSnapshot) {
+      const win = windowSnapshot(tabState.lastSnapshot, offset);
+      const response = { ok: true, format: 'aria', targetId, url: tabState.page.url(), snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
+      if (req.query.includeScreenshot === 'true') {
+        const pngBuffer = await tabState.page.screenshot({ type: 'png' });
+        response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
+      }
+      return res.json(response);
+    }
+
     tabState.refs = await buildRefs(tabState.page);
     
     const ariaYaml = await getAriaSnapshot(tabState.page);
@@ -1403,14 +1871,28 @@ app.get('/snapshot', async (req, res) => {
       }).join('\n');
     }
     
-    res.json({
+    tabState.lastSnapshot = annotatedYaml;
+    const win = windowSnapshot(annotatedYaml, 0);
+
+    const response = {
       ok: true,
       format: 'aria',
       targetId,
       url: tabState.page.url(),
-      snapshot: annotatedYaml,
-      refsCount: tabState.refs.size
-    });
+      snapshot: win.text,
+      refsCount: tabState.refs.size,
+      truncated: win.truncated,
+      totalChars: win.totalChars,
+      hasMore: win.hasMore,
+      nextOffset: win.nextOffset,
+    };
+
+    if (req.query.includeScreenshot === 'true') {
+      const pngBuffer = await tabState.page.screenshot({ type: 'png' });
+      response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
+    }
+
+    res.json(response);
   } catch (err) {
     log('error', 'openclaw snapshot failed', { reqId: req.reqId, error: err.message });
     res.status(500).json({ error: safeError(err) });
@@ -1582,6 +2064,32 @@ setInterval(() => {
     browserConnected: browser?.isConnected() ?? false,
   });
 }, 5 * 60_000);
+
+// Active health probe — detect hung browser even when isConnected() lies
+setInterval(async () => {
+  if (!browser || healthState.isRecovering) return;
+  // Skip probe if operations are in flight
+  if (healthState.activeOps > 0) {
+    log('info', 'health probe skipped, operations active', { activeOps: healthState.activeOps });
+    return;
+  }
+  const timeSinceSuccess = Date.now() - healthState.lastSuccessfulNav;
+  if (timeSinceSuccess < 120000) return;
+  
+  let testContext;
+  try {
+    testContext = await browser.newContext();
+    const page = await testContext.newPage();
+    await page.goto('about:blank', { timeout: 5000 });
+    await page.close();
+    await testContext.close();
+    healthState.lastSuccessfulNav = Date.now();
+  } catch (err) {
+    log('warn', 'health probe failed', { error: err.message, timeSinceSuccessMs: timeSinceSuccess });
+    if (testContext) await testContext.close().catch(() => {});
+    restartBrowser('health probe failed').catch(() => {});
+  }
+}, 60_000);
 
 // Crash logging
 process.on('uncaughtException', (err) => {

@@ -80,8 +80,11 @@ class BrowserClient {
     return this.request('POST', `/tabs/${tabId}/navigate`, { userId: this.userId, url: urlOrMacro });
   }
   
-  async getSnapshot(tabId) {
-    return this.request('GET', `/tabs/${tabId}/snapshot?userId=${this.userId}`);
+  async getSnapshot(tabId, options = {}) {
+    const params = new URLSearchParams({ userId: this.userId });
+    if (options.includeScreenshot) params.append('includeScreenshot', 'true');
+    if (options.offset) params.append('offset', String(options.offset));
+    return this.request('GET', `/tabs/${tabId}/snapshot?${params}`);
   }
   
   async click(tabId, options) {

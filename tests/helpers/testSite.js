@@ -184,6 +184,57 @@ function createTestApp() {
     `);
   });
   
+  // Page with a distinctive red box for screenshot content verification
+  app.get('/redbox', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Red Box</title>
+      <style>
+        body { margin: 0; padding: 0; background: white; }
+        #box { width: 200px; height: 200px; background: #ff0000; margin: 50px auto; }
+      </style>
+      </head>
+      <body>
+        <div id="box"></div>
+      </body></html>
+    `);
+  });
+
+  // Large page for snapshot truncation tests — simulates a big product listing
+  app.get('/large-page', (req, res) => {
+    const count = parseInt(req.query.count) || 500;
+    const items = Array.from({ length: count }, (_, i) =>
+      `<div role="listitem" aria-label="Product ${i}">
+        <a href="/product/${i}">Product ${i} - Premium Widget Model ${i}</a>
+        <span>$${(9.99 + i * 0.5).toFixed(2)}</span>
+        <span>★★★★☆ (${100 + i} reviews)</span>
+        <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>
+      </div>`
+    ).join('\n');
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Large Product Listing</title></head>
+      <body>
+        <header>
+          <h1>Product Search Results</h1>
+          <input type="search" placeholder="Search products..." />
+        </header>
+        <main>
+          <div role="list">
+            ${items}
+          </div>
+        </main>
+        <nav aria-label="Pagination">
+          <a href="/large-page?page=1">Previous</a>
+          <a href="/large-page?page=1">1</a>
+          <a href="/large-page?page=2">2</a>
+          <a href="/large-page?page=3">3</a>
+          <a href="/large-page?page=2">Next</a>
+        </nav>
+      </body></html>
+    `);
+  });
+
   // Page with scrollable content
   app.get('/scroll', (req, res) => {
     const items = Array.from({ length: 100 }, (_, i) => `<p id="item${i}">Item ${i}</p>`).join('\n');
