@@ -1,4 +1,4 @@
-const crypto = require('crypto');
+import crypto from 'crypto';
 
 class BrowserClient {
   constructor(baseUrl) {
@@ -137,6 +137,22 @@ class BrowserClient {
     if (options.offset) params.append('offset', options.offset);
     return this.request('GET', `/tabs/${tabId}/links?${params}`);
   }
+
+  async getDownloads(tabId, options = {}) {
+    const params = new URLSearchParams({ userId: this.userId });
+    if (options.includeData) params.append('includeData', 'true');
+    if (options.consume) params.append('consume', 'true');
+    if (options.maxBytes) params.append('maxBytes', String(options.maxBytes));
+    return this.request('GET', `/tabs/${tabId}/downloads?${params}`);
+  }
+
+  async getImages(tabId, options = {}) {
+    const params = new URLSearchParams({ userId: this.userId });
+    if (options.includeData) params.append('includeData', 'true');
+    if (options.maxBytes) params.append('maxBytes', String(options.maxBytes));
+    if (options.limit) params.append('limit', String(options.limit));
+    return this.request('GET', `/tabs/${tabId}/images?${params}`);
+  }
   
   async getStats(tabId) {
     return this.request('GET', `/tabs/${tabId}/stats?userId=${this.userId}`);
@@ -220,7 +236,7 @@ function createClient(baseUrl) {
   return new BrowserClient(baseUrl);
 }
 
-module.exports = {
+export {
   BrowserClient,
   createClient
 };
